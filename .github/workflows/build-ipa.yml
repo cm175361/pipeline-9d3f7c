@@ -1,0 +1,113 @@
+name: build-unsigned-ipa
+
+# Cloud-Mac route: GitHub Actions macOS runner builds the app with
+# signing disabled, then zips Payload/ into an UNSIGNED .ipa.
+# The user self-signs the artifact with his own p12 afterwards.
+on:
+  workflow_dispatch:
+    inputs:
+      vault_rehearsal:
+        description: "Rehearse the public-build vault pipeline (encrypt tree, wipe, decrypt, verify) before building"
+        type: boolean
+        default: false
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      # Public-build pipeline (pre-staged package 10): from
+      # package 11 the repo is public and carries ONLY an
+      # encrypted vault of the source; this secret is the only
+      # place the key exists. Absent (package ≤10 private
+      # builds) the vault steps below all skip.
+      SOURCE_VAULT_KEY_HEX: ${{ secrets.SOURCE_VAULT_KEY_HEX }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Public-build shape: if the checkout carries a vault
+      # file instead of the plaintext tree, decrypt it into
+      # place before anything else touches the source. The
+      # vault file itself is removed so it can never ride into
+      # the build products.
+      - name: Decrypt source vault (public builds)
+        if: ${{ hashFiles('source.vault') != '' }}
+        run: |
+          test -n "$SOURCE_VAULT_KEY_HEX" || { echo "vault present but key secret missing"; exit 1; }
+          tools/source-vault.sh decrypt source.vault ./restored
+          rm -rf project tools
+          cp -R restored/project restored/tools ./
+          rm -rf restored source.vault
+
+      # Package-10 rehearsal (private repo): prove the vault
+      # pipeline end-to-end — snapshot the tree, encrypt it,
+      # WIPE the plaintext, decrypt from the vault alone, and
+      # verify the restored tree byte-for-byte against the
+      # snapshot before the build proceeds.
+      - name: Vault pipeline rehearsal
+        if: ${{ inputs.vault_rehearsal }}
+        run: |
+          test -n "$SOURCE_VAULT_KEY_HEX" || { echo "rehearsal needs the vault key secret"; exit 1; }
+          mkdir -p /tmp/rehearsal
+          cp tools/source-vault.sh /tmp/rehearsal/source-vault.sh
+          (cd project && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > /tmp/rehearsal/manifest-before.txt
+          (cd tools && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) >> /tmp/rehearsal/manifest-before.txt
+          mkdir -p /tmp/rehearsal/tree/project /tmp/rehearsal/tree/tools
+          cp -R project/. /tmp/rehearsal/tree/project/
+          cp -R tools/. /tmp/rehearsal/tree/tools/
+          /tmp/rehearsal/source-vault.sh encrypt /tmp/rehearsal/tree /tmp/rehearsal/source.vault
+          rm -rf project tools
+          /tmp/rehearsal/source-vault.sh decrypt /tmp/rehearsal/source.vault ./restored
+          cp -R restored/project restored/tools ./
+          rm -rf restored
+          (cd project && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > /tmp/rehearsal/manifest-after.txt
+          (cd tools && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) >> /tmp/rehearsal/manifest-after.txt
+          diff /tmp/rehearsal/manifest-before.txt /tmp/rehearsal/manifest-after.txt
+          echo "vault rehearsal: restored tree byte-identical to pre-encryption tree"
+
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
+          xcodebuild -version
+
+      # Round 8 gate: the VMess byte core must reproduce the
+      # Python reference implementation's golden vectors exactly
+      # BEFORE any app build time is spent. A mismatch fails the
+      # job here and no IPA is produced.
+      - name: VMess byte-check (golden vectors)
+        run: |
+          swiftc -O -parse-as-library -o /tmp/vmess-bytecheck \
+            project/XudongIOS/Net/VmessCore.swift \
+            tools/vmess-bytecheck/main.swift
+          /tmp/vmess-bytecheck tools/vmess-bytecheck/vectors.json
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project project/XudongIOS.xcodeproj \
+            -scheme XudongIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "app: $APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry XudongIOS-unsigned.ipa Payload
+          ls -la XudongIOS-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XudongIOS-unsigned-ipa
+          path: XudongIOS-unsigned.ipa
+          retention-days: 14
